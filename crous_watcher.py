@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """
 CROUS Watcher — surveille les nouvelles annonces de logement en phase
-complémentaire sur trouverunlogement.lescrous.fr pour Paris intramuros,
+complémentaire sur trouverunlogement.lescrous.fr pour toute la France,
 et envoie un email dès qu'une nouvelle annonce apparaît.
-
-Le site étant une application JavaScript (Remix / turbo-stream), ce script
-utilise Playwright (navigateur automatisé headless) pour charger la page
-comme le ferait un vrai navigateur, plutôt que de parser une API interne
-difficile à décoder.
 """
 
 import json
@@ -19,21 +14,16 @@ import time
 from email.mime.text import MIMEText
 from pathlib import Path
 
+import requests
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright
 
 # ============================== CONFIG ==================================
 
-PARIS_BOUNDS = "2.224122_48.902156_2.4697602_48.8155755"
-SEARCH_URL = (
-    f"https://trouverunlogement.lescrous.fr/tools/47/search"
-    f"?bounds={PARIS_BOUNDS}&locationName=Paris"
-)
+SEARCH_URL = "https://trouverunlogement.lescrous.fr/tools/47/search"
 
 CHECK_INTERVAL_SECONDS = 5 * 60
 
 SEEN_FILE = Path(__file__).parent / "logements_vus.json"
-SCREENSHOT_FILE = Path(__file__).parent / "debug_screenshot.png"
 DEBUG_HTML_FILE = Path(__file__).parent / "dernier_html_debug.html"
 
 
@@ -48,87 +38,58 @@ SENDER_EMAIL = env_or_default("SENDER_EMAIL", "votre_adresse@gmail.com")
 SENDER_PASSWORD = env_or_default("SENDER_PASSWORD", "votre_mot_de_passe_application")
 RECEIVER_EMAIL = env_or_default("RECEIVER_EMAIL", "votre_adresse@gmail.com")
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "fr-FR,fr;q=0.9",
+}
+
 # ==========================================================================
 
 
-def fetch_rendered_html() -> str:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-            ),
-            locale="fr-FR",
-        )
-        page.goto(SEARCH_URL, wait_until="networkidle", timeout=45000)
-        page.wait_for_timeout(3000)
-        html = page.content()
-        page.screenshot(path=str(SCREENSHOT_FILE), full_page=True)
-        browser.close()
-        return html
+def fetch_page(url: str) -> str:
+    response = requests.get(url, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+    return response.text
 
 
 def parse_listings(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     listings = []
 
-    candidate_selectors = [
-        "div.fr-tile",
-        "article.fr-tile",
-        "div.fr-card",
-        "article.fr-card",
-        "div[class*='logement']",
-        "article[class*='logement']",
-        "div[class*='result-item']",
-        "li[class*='result']",
-        "div[class*='card']",
-        "a[href*='/tools/47/']",
-    ]
+    accommodation_links = soup.find_all("a", href=re.compile(r"/tools/\d+/accommodations/\d+"))
 
-    cards = []
-    for selector in candidate_selectors:
-        found = soup.select(selector)
-        found = [c for c in found if len(c.get_text(strip=True)) > 15]
-        if found:
-            cards = found
-            break
+    for link_tag in accommodation_links:
+        href = link_tag["href"]
+        if href.startswith("/"):
+            href = "https://trouverunlogement.lescrous.fr" + href
 
-    for card in cards:
-        # Liens génériques de navigation à ignorer (pas de vraies fiches logement)
-    NAV_PATHS = {"/tools/47/search", "/tools/47/cart", "/tools/47", "search", "cart"}
+        container = link_tag
+        text = ""
+        for _ in range(5):
+            if container.parent is None:
+                break
+            container = container.parent
+            candidate_text = " ".join(container.get_text(" ", strip=True).split())
+            if "€" in candidate_text and len(candidate_text) < 600:
+                text = candidate_text
+                break
 
-    for card in cards:
-        text = " ".join(card.get_text(" ", strip=True).split())
         if not text:
-            continue
-
-        link_tag = card if card.name == "a" else card.find("a", href=True)
-        link = link_tag["href"] if link_tag and link_tag.has_attr("href") else None
-        if link and link.startswith("/"):
-            link = "https://trouverunlogement.lescrous.fr" + link
-
-        # On ignore les liens de nav générale (pas de vraie fiche logement)
-        if link and any(link.rstrip("/").endswith(p) for p in NAV_PATHS):
-            continue
+            text = " ".join(link_tag.get_text(" ", strip=True).split())
 
         price_match = re.search(r"(\d[\d\s]*,?\d*)\s*€", text)
-        if not price_match:
-            # Pas de prix détecté = très probablement pas une vraie annonce, on ignore
-            continue
-        price = price_match.group(0)
-
-        uid = link or str(hash(text))
+        price = price_match.group(0) if price_match else "prix non trouvé"
 
         listings.append({
-            "id": uid,
+            "id": href,
             "text": text[:300],
             "price": price,
-            "link": link or SEARCH_URL,
+            "link": href,
         })
 
-    unique = {item["id"]: item for item in listings}
-    return list(unique.values())
     unique = {item["id"]: item for item in listings}
     return list(unique.values())
 
@@ -156,13 +117,13 @@ def send_email(subject: str, body: str) -> None:
 
 
 def notify_new_listings(new_listings: list[dict]) -> None:
-    lines = [f"{len(new_listings)} nouvelle(s) annonce(s) CROUS Paris intramuros :\n"]
+    lines = [f"{len(new_listings)} nouvelle(s) annonce(s) CROUS en France :\n"]
     for item in new_listings:
         lines.append(f"- {item['price']} — {item['text']}\n  Lien : {item['link']}\n")
     body = "\n".join(lines)
     print(body)
     try:
-        send_email("🏠 Nouvelle(s) annonce(s) CROUS Paris", body)
+        send_email("🏠 Nouvelle(s) annonce(s) CROUS", body)
         print("[OK] Email envoyé.")
     except Exception as exc:
         print(f"[ERREUR] Échec d'envoi de l'email : {exc}")
@@ -170,9 +131,9 @@ def notify_new_listings(new_listings: list[dict]) -> None:
 
 def check_once(seen: set) -> set:
     try:
-        html = fetch_rendered_html()
-    except Exception as exc:
-        print(f"[ERREUR] Impossible de charger la page : {exc}")
+        html = fetch_page(SEARCH_URL)
+    except requests.RequestException as exc:
+        print(f"[ERREUR] Impossible de récupérer la page : {exc}")
         return seen
 
     DEBUG_HTML_FILE.write_text(html, encoding="utf-8")
@@ -181,8 +142,7 @@ def check_once(seen: set) -> set:
     if not listings:
         print(
             "[ATTENTION] Aucune annonce détectée — soit il n'y en a réellement "
-            "aucune, soit les sélecteurs HTML doivent être ajustés. "
-            f"Voir la capture d'écran ({SCREENSHOT_FILE.name}) en pièce jointe du run GitHub Actions."
+            "aucune, soit les sélecteurs doivent être ajustés."
         )
         return seen
 
