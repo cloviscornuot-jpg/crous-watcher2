@@ -21,9 +21,7 @@ jobs:
           python-version: "3.11"
 
       - name: Installer les dépendances
-        run: |
-          pip install playwright beautifulsoup4
-          playwright install --with-deps chromium
+        run: pip install requests beautifulsoup4
 
       - name: Vérifier les nouvelles annonces
         env:
@@ -33,15 +31,6 @@ jobs:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
         run: python crous_watcher.py --once
-
-      - name: Sauvegarder la capture d'écran de debug
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshot
-          path: debug_screenshot.png
-          retention-days: 3
-          if-no-files-found: ignore
 
       - name: Sauvegarder la liste des annonces déjà vues
         run: |
