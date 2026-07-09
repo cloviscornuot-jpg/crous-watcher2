@@ -4,16 +4,10 @@ CROUS Watcher — surveille les nouvelles annonces de logement en phase
 complémentaire sur trouverunlogement.lescrous.fr pour Paris intramuros,
 et envoie un email dès qu'une nouvelle annonce apparaît.
 
-Installation :
-    pip install requests beautifulsoup4
-
-Configuration :
-    Remplissez la section CONFIG ci-dessous, puis lancez :
-        python crous_watcher.py --test     # envoie un email de test
-        python crous_watcher.py            # lance la surveillance en continu
-
-Astuce Gmail : utilisez un "mot de passe d'application" (pas votre mot de
-passe normal) -> https://myaccount.google.com/apppasswords
+Le site étant une application JavaScript (Remix / turbo-stream), ce script
+utilise Playwright (navigateur automatisé headless) pour charger la page
+comme le ferait un vrai navigateur, plutôt que de parser une API interne
+difficile à décoder.
 """
 
 import json
@@ -25,22 +19,25 @@ import time
 from email.mime.text import MIMEText
 from pathlib import Path
 
-import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 # ============================== CONFIG ==================================
 
-PARIS_BOUNDS = "2.2241_48.9021_2.4699_48.8156"
-SEARCH_URL = f"https://trouverunlogement.lescrous.fr/tools/45/search?bounds={PARIS_BOUNDS}"
-CHECK_INTERVAL_SECONDS = 5 * 60  # 5 minutes
+PARIS_BOUNDS = "2.224122_48.902156_2.4697602_48.8155755"
+SEARCH_URL = (
+    f"https://trouverunlogement.lescrous.fr/tools/47/search"
+    f"?bounds={PARIS_BOUNDS}&locationName=Paris"
+)
+
+CHECK_INTERVAL_SECONDS = 5 * 60
 
 SEEN_FILE = Path(__file__).parent / "logements_vus.json"
+SCREENSHOT_FILE = Path(__file__).parent / "debug_screenshot.png"
 DEBUG_HTML_FILE = Path(__file__).parent / "dernier_html_debug.html"
 
 
 def env_or_default(name: str, default: str) -> str:
-    """Comme os.environ.get, mais traite aussi une variable vide comme absente
-    (utile car GitHub Actions transforme un secret manquant en chaîne vide)."""
     value = os.environ.get(name)
     return value if value else default
 
@@ -51,20 +48,25 @@ SENDER_EMAIL = env_or_default("SENDER_EMAIL", "votre_adresse@gmail.com")
 SENDER_PASSWORD = env_or_default("SENDER_PASSWORD", "votre_mot_de_passe_application")
 RECEIVER_EMAIL = env_or_default("RECEIVER_EMAIL", "votre_adresse@gmail.com")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
-}
-
 # ==========================================================================
 
 
-def fetch_page(url: str) -> str:
-    response = requests.get(url, headers=HEADERS, timeout=20)
-    response.raise_for_status()
-    return response.text
+def fetch_rendered_html() -> str:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            locale="fr-FR",
+        )
+        page.goto(SEARCH_URL, wait_until="networkidle", timeout=45000)
+        page.wait_for_timeout(3000)
+        html = page.content()
+        page.screenshot(path=str(SCREENSHOT_FILE), full_page=True)
+        browser.close()
+        return html
 
 
 def parse_listings(html: str) -> list[dict]:
@@ -80,18 +82,17 @@ def parse_listings(html: str) -> list[dict]:
         "article[class*='logement']",
         "div[class*='result-item']",
         "li[class*='result']",
+        "div[class*='card']",
+        "a[href*='/tools/47/']",
     ]
 
     cards = []
     for selector in candidate_selectors:
         found = soup.select(selector)
+        found = [c for c in found if len(c.get_text(strip=True)) > 15]
         if found:
             cards = found
             break
-
-    if not cards:
-        links = soup.find_all("a", href=re.compile(r"/tools/\d+/(description|logement)"))
-        cards = links
 
     for card in cards:
         text = " ".join(card.get_text(" ", strip=True).split())
@@ -156,20 +157,20 @@ def notify_new_listings(new_listings: list[dict]) -> None:
 
 def check_once(seen: set) -> set:
     try:
-        html = fetch_page(SEARCH_URL)
-    except requests.RequestException as exc:
-        print(f"[ERREUR] Impossible de récupérer la page : {exc}")
+        html = fetch_rendered_html()
+    except Exception as exc:
+        print(f"[ERREUR] Impossible de charger la page : {exc}")
         return seen
 
+    DEBUG_HTML_FILE.write_text(html, encoding="utf-8")
     listings = parse_listings(html)
 
     if not listings:
         print(
             "[ATTENTION] Aucune annonce détectée — soit il n'y en a réellement "
-            "aucune, soit les sélecteurs HTML doivent être ajustés."
+            "aucune, soit les sélecteurs HTML doivent être ajustés. "
+            f"Voir la capture d'écran ({SCREENSHOT_FILE.name}) en pièce jointe du run GitHub Actions."
         )
-        DEBUG_HTML_FILE.write_text(html, encoding="utf-8")
-        print(f"HTML brut sauvegardé dans {DEBUG_HTML_FILE} pour inspection.")
         return seen
 
     new_ids = {item["id"] for item in listings} - seen
