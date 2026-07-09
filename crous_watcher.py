@@ -95,6 +95,10 @@ def parse_listings(html: str) -> list[dict]:
             break
 
     for card in cards:
+        # Liens génériques de navigation à ignorer (pas de vraies fiches logement)
+    NAV_PATHS = {"/tools/47/search", "/tools/47/cart", "/tools/47", "search", "cart"}
+
+    for card in cards:
         text = " ".join(card.get_text(" ", strip=True).split())
         if not text:
             continue
@@ -104,10 +108,17 @@ def parse_listings(html: str) -> list[dict]:
         if link and link.startswith("/"):
             link = "https://trouverunlogement.lescrous.fr" + link
 
-        uid = link or str(hash(text))
+        # On ignore les liens de nav générale (pas de vraie fiche logement)
+        if link and any(link.rstrip("/").endswith(p) for p in NAV_PATHS):
+            continue
 
         price_match = re.search(r"(\d[\d\s]*,?\d*)\s*€", text)
-        price = price_match.group(0) if price_match else "prix non trouvé"
+        if not price_match:
+            # Pas de prix détecté = très probablement pas une vraie annonce, on ignore
+            continue
+        price = price_match.group(0)
+
+        uid = link or str(hash(text))
 
         listings.append({
             "id": uid,
@@ -116,6 +127,8 @@ def parse_listings(html: str) -> list[dict]:
             "link": link or SEARCH_URL,
         })
 
+    unique = {item["id"]: item for item in listings}
+    return list(unique.values())
     unique = {item["id"]: item for item in listings}
     return list(unique.values())
 
