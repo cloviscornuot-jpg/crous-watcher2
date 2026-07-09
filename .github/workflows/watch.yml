@@ -1,0 +1,41 @@
+name: CROUS Watcher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        run: pip install requests beautifulsoup4
+
+      - name: Vérifier les nouvelles annonces
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+        run: python crous_watcher.py --once
+
+      - name: Sauvegarder la liste des annonces déjà vues
+        run: |
+          git config user.name "crous-watcher-bot"
+          git config user.email "bot@example.com"
+          git add logements_vus.json
+          git diff --quiet --cached || git commit -m "Mise à jour des annonces vues"
+          git push
