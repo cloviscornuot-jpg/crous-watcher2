@@ -30,32 +30,26 @@ from bs4 import BeautifulSoup
 
 # ============================== CONFIG ==================================
 
-# Bounding box Paris intramuros (format lon_lat_lon_lat : coin NO puis coin SE)
-# Vous pouvez recalculer ce paramètre vous-même en allant sur le site,
-# en filtrant la carte sur la zone souhaitée, et en copiant le "bounds=..."
-# présent dans l'URL de la page.
 PARIS_BOUNDS = "2.2241_48.9021_2.4699_48.8156"
-
-# tools/45 = logements pour l'année universitaire 2026-2027 (à vérifier :
-# ouvrez le site, faites une recherche, et copiez le bon numéro de "tools/XX"
-# si jamais le CROUS a changé l'identifiant entre-temps).
 SEARCH_URL = f"https://trouverunlogement.lescrous.fr/tools/45/search?bounds={PARIS_BOUNDS}"
-
 CHECK_INTERVAL_SECONDS = 5 * 60  # 5 minutes
 
 SEEN_FILE = Path(__file__).parent / "logements_vus.json"
 DEBUG_HTML_FILE = Path(__file__).parent / "dernier_html_debug.html"
 
-# --- Email (SMTP) ---
-# Ces valeurs peuvent être surchargées par des variables d'environnement
-# (utilisé automatiquement par le workflow GitHub Actions via les Secrets).
-# Pour un usage 100% local, vous pouvez aussi remplir directement les
-# valeurs par défaut ci-dessous.
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "votre_adresse@gmail.com")
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "votre_mot_de_passe_application")
-RECEIVER_EMAIL = os.environ.get("RECEIVER_EMAIL", "votre_adresse@gmail.com")
+
+def env_or_default(name: str, default: str) -> str:
+    """Comme os.environ.get, mais traite aussi une variable vide comme absente
+    (utile car GitHub Actions transforme un secret manquant en chaîne vide)."""
+    value = os.environ.get(name)
+    return value if value else default
+
+
+SMTP_HOST = env_or_default("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(env_or_default("SMTP_PORT", "587"))
+SENDER_EMAIL = env_or_default("SENDER_EMAIL", "votre_adresse@gmail.com")
+SENDER_PASSWORD = env_or_default("SENDER_PASSWORD", "votre_mot_de_passe_application")
+RECEIVER_EMAIL = env_or_default("RECEIVER_EMAIL", "votre_adresse@gmail.com")
 
 HEADERS = {
     "User-Agent": (
@@ -74,15 +68,6 @@ def fetch_page(url: str) -> str:
 
 
 def parse_listings(html: str) -> list[dict]:
-    """
-    Extrait les annonces de logement de la page.
-
-    Le site utilise vraisemblablement le Système de Design de l'État (DSFR),
-    on essaie donc plusieurs sélecteurs courants. Si aucun ne fonctionne,
-    on sauvegarde le HTML brut dans DEBUG_HTML_FILE pour pouvoir ajuster
-    facilement les sélecteurs (cherchez la carte d'une annonce avec les
-    outils de développement du navigateur -> clic droit -> Inspecter).
-    """
     soup = BeautifulSoup(html, "html.parser")
     listings = []
 
@@ -105,7 +90,6 @@ def parse_listings(html: str) -> list[dict]:
             break
 
     if not cards:
-        # Dernier recours : on part des liens qui pointent vers une fiche de logement
         links = soup.find_all("a", href=re.compile(r"/tools/\d+/(description|logement)"))
         cards = links
 
@@ -119,7 +103,6 @@ def parse_listings(html: str) -> list[dict]:
         if link and link.startswith("/"):
             link = "https://trouverunlogement.lescrous.fr" + link
 
-        # Identifiant unique : on préfère le lien, sinon on hash le texte
         uid = link or str(hash(text))
 
         price_match = re.search(r"(\d[\d\s]*,?\d*)\s*€", text)
@@ -132,7 +115,6 @@ def parse_listings(html: str) -> list[dict]:
             "link": link or SEARCH_URL,
         })
 
-    # Déduplique par id
     unique = {item["id"]: item for item in listings}
     return list(unique.values())
 
@@ -211,7 +193,6 @@ def main() -> None:
         return
 
     if "--once" in sys.argv:
-        # Mode utilisé par GitHub Actions : une seule vérification puis on quitte.
         seen = load_seen()
         check_once(seen)
         return
