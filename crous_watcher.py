@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CROUS Watcher — surveille les nouvelles annonces de logement en phase
-complémentaire sur trouverunlogement.lescrous.fr pour toute la France,
+complémentaire sur trouverunlogement.lescrous.fr pour Paris intramuros,
 et envoie un email dès qu'une nouvelle annonce apparaît.
 """
 
@@ -20,6 +20,11 @@ from bs4 import BeautifulSoup
 # ============================== CONFIG ==================================
 
 SEARCH_URL = "https://trouverunlogement.lescrous.fr/tools/47/search"
+
+# Ne garde que les logements dont l'adresse contient un code postal
+# parisien (75001 à 75020). Passez à False pour surveiller toute la France.
+FILTER_PARIS_ONLY = True
+PARIS_POSTCODE_REGEX = re.compile(r"\b75(0[1-9]|1[0-9]|20)\b")
 
 CHECK_INTERVAL_SECONDS = 5 * 60
 
@@ -55,6 +60,27 @@ def fetch_page(url: str) -> str:
     return response.text
 
 
+def get_total_pages(html: str) -> int:
+    match = re.search(r"page\s+\d+\s+sur\s+(\d+)", html, re.IGNORECASE)
+    return int(match.group(1)) if match else 1
+
+
+def fetch_all_pages_html() -> list[str]:
+    first_html = fetch_page(SEARCH_URL)
+    total_pages = max(1, get_total_pages(first_html))
+    pages_html = [first_html]
+
+    for page_num in range(2, total_pages + 1):
+        time.sleep(1)
+        try:
+            pages_html.append(fetch_page(f"{SEARCH_URL}?page={page_num}"))
+        except requests.RequestException as exc:
+            print(f"[ATTENTION] Échec récupération page {page_num} : {exc}")
+            break
+
+    return pages_html
+
+
 def parse_listings(html: str) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     listings = []
@@ -68,12 +94,12 @@ def parse_listings(html: str) -> list[dict]:
 
         container = link_tag
         text = ""
-        for _ in range(5):
+        for _ in range(8):
             if container.parent is None:
                 break
             container = container.parent
             candidate_text = " ".join(container.get_text(" ", strip=True).split())
-            if "€" in candidate_text and len(candidate_text) < 600:
+            if "€" in candidate_text:
                 text = candidate_text
                 break
 
@@ -117,13 +143,13 @@ def send_email(subject: str, body: str) -> None:
 
 
 def notify_new_listings(new_listings: list[dict]) -> None:
-    lines = [f"{len(new_listings)} nouvelle(s) annonce(s) CROUS en France :\n"]
+    lines = [f"{len(new_listings)} nouvelle(s) annonce(s) CROUS à Paris :\n"]
     for item in new_listings:
         lines.append(f"- {item['price']} — {item['text']}\n  Lien : {item['link']}\n")
     body = "\n".join(lines)
     print(body)
     try:
-        send_email("🏠 Nouvelle(s) annonce(s) CROUS", body)
+        send_email("🏠 Nouvelle(s) annonce(s) CROUS Paris", body)
         print("[OK] Email envoyé.")
     except Exception as exc:
         print(f"[ERREUR] Échec d'envoi de l'email : {exc}")
@@ -131,18 +157,25 @@ def notify_new_listings(new_listings: list[dict]) -> None:
 
 def check_once(seen: set) -> set:
     try:
-        html = fetch_page(SEARCH_URL)
+        pages_html = fetch_all_pages_html()
     except requests.RequestException as exc:
         print(f"[ERREUR] Impossible de récupérer la page : {exc}")
         return seen
 
-    DEBUG_HTML_FILE.write_text(html, encoding="utf-8")
-    listings = parse_listings(html)
+    DEBUG_HTML_FILE.write_text(pages_html[0], encoding="utf-8")
+
+    listings = []
+    for page_html in pages_html:
+        listings.extend(parse_listings(page_html))
+    listings = list({item["id"]: item for item in listings}.values())
+
+    if FILTER_PARIS_ONLY:
+        listings = [item for item in listings if PARIS_POSTCODE_REGEX.search(item["text"])]
 
     if not listings:
         print(
-            "[ATTENTION] Aucune annonce détectée — soit il n'y en a réellement "
-            "aucune, soit les sélecteurs doivent être ajustés."
+            "[ATTENTION] Aucune annonce détectée pour Paris — c'est peut-être "
+            "simplement qu'il n'y en a réellement aucune en ce moment."
         )
         return seen
 
@@ -152,7 +185,7 @@ def check_once(seen: set) -> set:
     if new_listings:
         notify_new_listings(new_listings)
     else:
-        print(f"[{time.strftime('%H:%M:%S')}] Aucune nouvelle annonce ({len(listings)} au total).")
+        print(f"[{time.strftime('%H:%M:%S')}] Aucune nouvelle annonce ({len(listings)} au total à Paris).")
 
     seen |= {item["id"] for item in listings}
     save_seen(seen)
